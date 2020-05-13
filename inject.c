@@ -14,6 +14,9 @@
 #include <pcap.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <argp.h>
 #include <string.h>
 #include <arpa/inet.h>
 #include <linux/ip.h>
@@ -36,17 +39,6 @@ struct ieee80211_hdr {
 
 /*************************** START READING AGAIN ******************************/
 
-/* A bogus MAC address just to show that it can be done */
-const uint8_t mac[6] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab };
-
-/**
- * Note that we are using the broadcast address as the destination and the
- * link-local address as the source to be nice to routers and such.
- *
- */
-const char * to = "255.255.255.255";
-const char * from = "169.254.1.1";
-
 /**
  * Radiotap is a protocol of sorts that is used to convey information about the
  * physical-layer part of wireless transmissions. When monitoring an interface
@@ -64,41 +56,8 @@ const char * from = "169.254.1.1";
  * that option (for rate and channel for example, we'll let the card decide).
  */
 static const uint8_t u8aRadiotapHeader[] = {
-
-  0x00, 0x00, // <-- radiotap version (ignore this)
-  0x18, 0x00, // <-- number of bytes in our header (count the number of "0x"s)
-
-  /**
-   * The next field is a bitmap of which options we are including.
-   * The full list of which field is which option is in ieee80211_radiotap.h,
-   * but I've chosen to include:
-   *   0x00 0x01: timestamp
-   *   0x00 0x02: flags
-   *   0x00 0x03: rate
-   *   0x00 0x04: channel
-   *   0x80 0x00: tx flags (seems silly to have this AND flags, but oh well)
-   */
-  0x0f, 0x80, 0x00, 0x00,
-
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // <-- timestamp
-
-  /**
-   * This is the first set of flags, and we've set the bit corresponding to
-   * IEEE80211_RADIOTAP_F_FCS, meaning we want the card to add a FCS at the end
-   * of our buffer for us.
-   */
-  0x10,
-
-  0x00, // <-- rate
-  0x00, 0x00, 0x00, 0x00, // <-- channel
-
-  /**
-   * This is the second set of flags, specifically related to transmissions. The
-   * bit we've set is IEEE80211_RADIOTAP_F_TX_NOACK, which means the card won't
-   * wait for an ACK for this frame, and that it won't retry if it doesn't get
-   * one.
-   */
-  0x08, 0x00,
+  0x00, 0x00, 0x0C, 0x00, 0x06, 0x80, 0x00, 0x00, 0x10, 0x0c, 0x08, 0x00 // from Scapy
+//  0x00, 0x00, 0x0C, 0x00, 0x06, 0x80, 0x00, 0x00, 0x10, 0x02, 0x08, 0x00 // from Scapy
 };
 
 /**
@@ -116,45 +75,247 @@ static const uint8_t u8aRadiotapHeader[] = {
  * set the first three of them to 0. The last two bytes can then finally be set
  * to 0x0800, which is the IP EtherType.
  */
-const uint8_t ipllc[8] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00 };
+const uint8_t ipllc[6] = { 0x00, 0x00, 0x03, 0x00, 0x00, 0x00 };
 
-/**
- * A simple implementation of the internet checksum used by IP
- * Not very interesting, so it has been moved below main()
- */
-uint16_t inet_csum(const void *buf, size_t hdr_len);
+/* The parts of our packet */
+uint8_t *rt; /* radiotap */
+struct ieee80211_hdr *hdr;
+uint8_t *llc;
+uint8_t *data;
 
-int main(void) {
+/* Other useful bits */
+uint8_t *buf;
+size_t sz;
+uint8_t fcchunk[2]; /* 802.11 header frame control */
 
-  /* The parts of our packet */
-  uint8_t *rt; /* radiotap */
-  struct ieee80211_hdr *hdr;
-  uint8_t *llc;
-  struct iphdr *ip;
-  struct udphdr *udp;
-  uint8_t *data;
+uint8_t p[1500+sizeof(u8aRadiotapHeader)];
 
-  /* Other useful bits */
-  uint8_t *buf;
-  size_t sz;
-  uint8_t fcchunk[2]; /* 802.11 header frame control */
-  struct sockaddr_in saddr, daddr; /* IP source and destination */
+const char *argp_program_version = "inject 0.1";
+const char *argp_program_bug_address = "inject-bugs@klickitat.com";
+
+static char doc[] =
+  "inject takes an input file, chops it into blocksize chunks and injects them\v\
+into a monitor mode wifi interface.";
+
+int verbose = 0;
+int version = 0;
+uint32_t delay = 0;
+char const *iface = "mon0";
+int n = 1;
+int k = 1;
+int blocksize = 1400;
+uint8_t *sender;
+uint8_t mac[6] = { 0x05, 0x03, 0x05, 0x03, 0x05, 0x03 };
+int pass = 1;
+int transmission = 1;
+int eot = 3;
+
+struct arguments {
+  unsigned n;
+  char **argz;
+};
+
+static int
+parse_opt (int key, char *arg, struct argp_state *state)
+{
+  struct arguments *a = (struct arguments *) state->input;
+  switch (key)
+    {
+
+    case 'i':
+      iface = arg;
+      break;
+
+    case 'n':
+      n = atoi(arg);
+      break;
+
+    case 'k':
+      k = atoi(arg);
+      break;
+
+    case 'd':
+      delay = atoi(arg);
+      break;
+
+    case 'b':
+      blocksize = atoi(arg);
+      break;
+
+    case 's':
+      sender = arg;
+      int rc = sscanf(sender, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+		      mac, mac + 1, mac + 2, mac + 3, mac + 4, mac + 5);
+      if (rc != 6) {
+	fprintf(stderr,"Error: invalid macaddr: %s\n",arg);
+	exit(-1);
+      }
+      break;
+
+    case 'p':
+      pass = atoi(arg);
+      break;
+
+    case 't':
+      transmission = atoi(arg);
+      break;
+
+    case 'e':
+      eot = atoi(arg);
+      break;
+
+    case 'v':
+      verbose++;
+      break;
+
+    case 'V':
+      version = 1;
+      break;
+
+    case ARGP_KEY_INIT:
+      a->n = 0;
+      a->argz[a->n] = NULL;
+      break;
+
+    case ARGP_KEY_ARG:
+      a->argz[a->n] = strdup(arg);
+      a->n++;
+      a->argz[a->n] = NULL;
+      break;
+    }
+  return 0;
+}
+
+int hexdump(uint8_t *ptr,int size) {
+  int i=0;
+
+  while (i<size) {
+    printf("%08x",i);
+    for(int j=0 ; j<16 && i<size ; i++,j++) {
+      printf(" %02x",*(ptr+i));
+    }
+    printf("\n");
+  }
+  return 0;
+}
+
+int sendfile(pcap_t *ppcap,int fd) {
+  int in; // bytes read
+  uint32_t frame = 0;
+  uint16_t r[3];
+
+  hdr->addr1[0] = pass & 0xff;
+  hdr->addr1[1] = transmission & 0xff;
+  r[0] = htons((uint16_t) n);
+  r[1] = htons((uint16_t) k);
+  r[2] = 0;
+  memcpy(&hdr->addr3[0],(uint8_t *) r,6);
+
+  while((in = read(fd,data,blocksize)) > 0) {
+    uint32_t q = htonl(frame);
+    memcpy(&hdr->addr1[2],((uint8_t *) &q),4);
+    if(verbose > 2) hexdump(p,sz+in);
+    if (pcap_sendpacket(ppcap, p, sz + in) != 0) {    
+      /**
+       * If something went wrong, let's let our user know
+       */
+      pcap_perror(ppcap, "Failed to inject packet");
+      return 1;
+    }
+    if (delay) {
+      usleep(delay);
+    }
+    if (verbose) {
+      printf("frame %d (%ld bytes)\n",frame,sz+in);
+    }
+    frame++;
+  }
+
+  memset(&hdr->addr3[0],0xff,6);
+  for(int i=0 ; i<eot ; i++) {
+    uint32_t q = htonl(frame);
+    memcpy(&hdr->addr1[2],((uint8_t *) &q),4);
+    memset(data,0xff,4); // clear any FCS
+    if(verbose > 2) hexdump(p,sz);
+    if (pcap_sendpacket(ppcap, p, sz) != 0) {
+      /**
+       * If something went wrong, let's let our user know
+       */
+      pcap_perror(ppcap, "Failed to inject packet");
+      return 1;
+    }
+    if (delay) {
+      usleep(delay);
+    }
+    if (verbose) {
+      printf("eot frame %d (%ld bytes)\n",frame,sz);
+    }
+    frame++;
+  }
+
+  return 0;
+}
+
+int main(int argc,char** argv)
+{
+  int c;
+
+  struct argp_option options[] = {
+    { "verbose", 'v', 0, 0, "Be more verbose" },
+    { "version", 'V', 0, 0, "Version" },
+    { "iface", 'i', "<interface>", 0, "Specify the monitor mode interface (default: mon0)" },
+    { "delay", 'd', "<delay>", 0, "interpacket delay in microseconds {default: 0)" },
+    { 0, 'n', "<n>", 0, "LDPC Staircase n blocks (default: 1)" },
+    { 0, 'k', "<k>", 0, "LDPC Staircase k blocks (default: 1)" },
+    { "blocksize", 'b', "<blocksize>", 0, "Blocksize in bytes (default: 1400)" },
+    { "sender", 's', "<macaddr>", 0, "Sending BSSID (default: 05:03:05:03:05:03)" },
+    { "pass", 'p', "<pass>", 0, "Scheduled pass number (default: 1)" },
+    { "transmission", 't', "<fileno>", 0, "Image number within pass (default: 1)" },
+    { "eot", 'e', "<n>", 0, "Number of EOT packets to send (default: 1)" },
+    { 0 }
+  };
+
+  struct argp argp = { options, parse_opt, "input file", doc };
+
+  struct arguments arguments;
+  arguments.argz = (char **) calloc (argc, sizeof (char *));
+  arguments.argz[0] = NULL;
+  arguments.n = 0;
+
+  int arg_count = 0;
+  if (argp_parse (&argp, argc, argv, 0, 0, &arguments))
+    return -1;
+
+  if(verbose) {
+    fprintf(stderr,"verbose = %d\n",verbose);
+    fprintf(stderr,"version = %d\n",version);
+    fprintf(stderr,"iface = %s\n",iface);
+    fprintf(stderr,"delay = %u\n",delay);
+    fprintf(stderr,"n = %d\n",n);
+    fprintf(stderr,"k = %d\n",k);
+    fprintf(stderr,"blocksize = %d\n",blocksize);
+    fprintf(stderr,"sender = %02x:%02x:%02x:%02x:%02x:%02x\n",mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+    fprintf(stderr,"pass = %d\n",pass);
+    fprintf(stderr,"transmission = %d\n",transmission);
+    fprintf(stderr,"eot = %d\n",eot);
+    for (int i=0 ; i<arguments.n ; i++) {
+      fprintf(stderr,"argz[%u] = %s\n",i,arguments.argz[i]);
+    }
+
+  }
 
   /* PCAP vars */
   char errbuf[PCAP_ERRBUF_SIZE];
   pcap_t *ppcap;
-  
+ 
   /* Total buffer size (note the 0 bytes of data and the 4 bytes of FCS */
-  sz = sizeof(u8aRadiotapHeader) + sizeof(struct ieee80211_hdr) + sizeof(ipllc) + sizeof(struct iphdr) + sizeof(struct udphdr) + 0 /* data */ + 4 /* FCS */;
-  buf = (uint8_t *) malloc(sz);
+  sz = sizeof(u8aRadiotapHeader) + sizeof(struct ieee80211_hdr) + sizeof(ipllc) + 0 /* data */ + 4 /* FCS */;
 
   /* Put our pointers in the right place */
-  rt = (uint8_t *) buf;
-  hdr = (struct ieee80211_hdr *) (rt+sizeof(u8aRadiotapHeader));
-  llc = (uint8_t *) (hdr+1);
-  ip = (struct iphdr *) (llc+sizeof(ipllc));
-  udp = (struct udphdr *) (ip+1);
-  data = (uint8_t *) (udp+1);
+  rt = p;
+  hdr = (struct ieee80211_hdr *) (p+sizeof(u8aRadiotapHeader));
+  llc = (uint8_t *) (p + sizeof(u8aRadiotapHeader) + sizeof(struct ieee80211_hdr));
+  data = (uint8_t *) (llc + sizeof(ipllc));
 
   /* The radiotap header has been explained already */
   memcpy(rt, u8aRadiotapHeader, sizeof(u8aRadiotapHeader));
@@ -200,104 +361,43 @@ int main(void) {
    * be present unless both TODS *and* FROMDS has been set (as shown above).
    */
   hdr->duration_id = 0xffff;
-  memcpy(&hdr->addr1[0], mac, 6*sizeof(uint8_t));
   memcpy(&hdr->addr2[0], mac, 6*sizeof(uint8_t));
-  memcpy(&hdr->addr3[0], mac, 6*sizeof(uint8_t));
   hdr->seq_ctrl = 0;
   //hdr->addr4;
 
+  
   /* The LLC+SNAP header has already been explained above */
-  memcpy(llc, ipllc, 8*sizeof(uint8_t));
-
-  /**
-   * Now we're getting into familiar territory, IP headers!
-   *
-   * Remember that the tot_length is little-endian, so we need to run htons()
-   * over the entire "real" length.
-   */
-  daddr.sin_family = AF_INET;
-  saddr.sin_family = AF_INET;
-  daddr.sin_port = htons(50505);
-  saddr.sin_port = htons(50505);
-  inet_pton(AF_INET, to, (struct in_addr *)&daddr.sin_addr.s_addr);
-  inet_pton(AF_INET, from, (struct in_addr *)&saddr.sin_addr.s_addr);
-
-  ip->ihl      = 5; /* header length, number of 32-bit words */
-  ip->version  = 4;
-  ip->tos      = 0x0;
-  ip->id       = 0;
-  ip->frag_off = htons(0x4000); /* Don't fragment */
-  ip->ttl      = 64;
-  ip->tot_len  = htons(sizeof(struct iphdr) + sizeof(struct udphdr) + 0 /* data */);
-  ip->protocol = IPPROTO_UDP;
-  ip->saddr    = saddr.sin_addr.s_addr;
-  ip->daddr    = daddr.sin_addr.s_addr;
-
-  /**
-   * The checksum should be calculated over the entire header with the checksum
-   * field set to 0, so that's what we do
-   */
-  ip->check    = 0; 
-  ip->check    = inet_csum(ip, sizeof(struct iphdr));
-
-  /**
-   * The UDP header is refreshingly simple.
-   * Again, notice the little-endianness of ->len
-   * UDP also lets us set the checksum to 0 to ignore it
-   */
-  udp->source  = saddr.sin_port;
-  udp->dest    = daddr.sin_port;
-  udp->len     = htons(sizeof(struct udphdr) + 0 /* data */);
-  udp->check   = 0;
+  memcpy(llc, ipllc, sizeof(ipllc));
 
   /**
    * Finally, we have the packet and are ready to inject it.
    * First, we open the interface we want to inject on using pcap.
    */
-  ppcap = pcap_open_live("wlan0", 800, 1, 20, errbuf);
+  ppcap = pcap_open_live(iface, 800, 1, 20, errbuf);
 
   if (ppcap == NULL) {
     printf("Could not open interface wlan0 for packet injection: %s", errbuf);
     return 2;
   }
 
-  /**
-   * Then we send the packet and clean up after ourselves
-   */
-  if (pcap_sendpacket(ppcap, buf, sz) == 0) {
-    pcap_close(ppcap);
-    return 0;
-  }
 
-  /**
-   * If something went wrong, let's let our user know
-   */
-  pcap_perror(ppcap, "Failed to inject packet");
+  int fd;
+
+  // for each filename (special case: no filename = stdin)
+  if (arguments.n == 0) {
+      fd = fileno(stdin);
+      sendfile(ppcap,fd);
+      close(fd);
+  }
+  else {
+    for(int i=0 ; i<arguments.n ; i++) {
+      fd = open(arguments.argz[i],O_RDONLY);
+      sendfile(ppcap,fd);
+      close(fd);
+    }
+  }
+  
   pcap_close(ppcap);
-  return 1;
-}
-
-/**
- * And that's it - a complete wireless packet injection function using pcap!
- */
-
-uint16_t inet_csum(const void *buf, size_t hdr_len)
-{
-  unsigned long sum = 0;
-  const uint16_t *ip1;
-
-  ip1 = (const uint16_t *) buf;
-  while (hdr_len > 1)
-  {
-    sum += *ip1++;
-    if (sum & 0x80000000)
-      sum = (sum & 0xFFFF) + (sum >> 16);
-    hdr_len -= 2;
-  }
-
-  while (sum >> 16)
-    sum = (sum & 0xFFFF) + (sum >> 16);
-
-  return(~sum);
+  return 0;
 }
 
